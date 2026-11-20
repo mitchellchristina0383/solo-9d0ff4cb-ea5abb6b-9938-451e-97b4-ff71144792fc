@@ -17,6 +17,16 @@ images, exposed as a FastAPI service and persisted in a single SQLite database.
   inherited content and every acknowledged write is preserved. Base blocks no
   volume inherits any more are released and recycled into a free-slot pool that
   later writes reuse.
+* **Pool byte budget** (`BLOCKSTORE_POOL_BUDGET_BYTES`) caps the on-disk block
+  pool. Every allocated slot counts its full block length against the cap,
+  including recycled (zeroed, free) slots. Importing identical content or
+  reusing a same-size free slot consumes no new budget. When the pool is full,
+  an overwrite or zero still succeeds if the block being replaced is the old
+  payload's only reference — that slot is released and recycled in place, so
+  the footprint does not grow. Any request that would overflow the cap fails
+  with `507 pool_budget_exceeded` and is rolled back entirely: no slot,
+  reference count or reclaim-event change survives. Leave the variable unset
+  for an unlimited pool.
 * All state is committed in SQLite WAL transactions with `synchronous=FULL`, so
   after a crash or `SIGKILL` a volume remains readable and writable, and a base
   is either fully usable or fully retired (never half-removed).
@@ -40,6 +50,12 @@ docker compose down -v       # stop and wipe the database volume
 
 Override the published port with `BLOCKSTORE_PORT=9000 docker compose up -d`.
 
+The pool byte budget is set by `BLOCKSTORE_POOL_BUDGET_BYTES` (default
+`128` bytes in the Compose file, deliberately small so the cap is easy to
+exercise on the demo data). Change it with, e.g.,
+`BLOCKSTORE_POOL_BUDGET_BYTES=1048576 docker compose up -d`; an empty value runs
+the pool without a cap.
+
 ## Demonstration (`/docs`)
 
 Use the Swagger UI, or run the scripted version against the running service:
@@ -59,6 +75,24 @@ The script performs the whole workflow and asserts each step:
    and untouched inherited block all survive; direct base read → `410`,
 7. delete the volumes, observe reclaimed slots and a later write reusing them,
 8. run `/verify`.
+
+### Byte-budget demonstration
+
+The cap is visible in `GET /stats` under `pool_budget` and every rejection
+comes back as `507` with code `pool_budget_exceeded`. A scripted walk-through of
+the full-pool replacement rule and concurrent allocation is:
+
+```bash
+python scripts/budget_demo.py --url http://localhost:8000
+```
+
+It fills the pool, shows an overflow being rejected with a full rollback,
+retires the base so a volume block becomes its payload's sole reference,
+proves the overwrite then succeeds without growing the pool, and finally fires
+parallel writes showing the cap is never exceeded under concurrency while
+`/verify` stays clean. The same steps are available interactively in `/docs`
+via the existing `POST /bases`, `PUT /volumes/.../blocks/...`,
+`POST .../zero` and `GET /stats` endpoints — no new routes were added.
 
 ## API summary
 
@@ -103,7 +137,12 @@ block, 65 536 blocks and 256 MiB per base).
 
 Every mutation is a `BEGIN IMMEDIATE` transaction, so concurrent writers queue
 on SQLite's write lock (bounded by `BLOCKSTORE_BUSY_TIMEOUT_SECONDS`, default
-30 s) rather than corrupting reference counts.
+30 s) rather than corrupting reference counts. The budget check runs inside the
+same transaction, after the old reference has been dropped for an overwrite or
+zero: writers therefore serialise against the *committed* pool usage, which is
+what makes over-allocation impossible under concurrency. A failed check raises
+before commit, and the transaction context manager rolls back every change made
+by that request — payload slots, refcounts and `reclaim_events` rows alike.
 
 ## Local development
 
@@ -117,11 +156,13 @@ uvicorn app.main:app --reload        # BLOCKSTORE_DB defaults to ./blockstore.db
 ## Tests and checks
 
 ```bash
-pytest -q                            # 40 tests: blocks, dedup, retirement,
-                                     # concurrency, restart/crash recovery
+pytest -q                            # 52 tests: blocks, dedup, retirement,
+                                     # concurrency, pool byte budget,
+                                     # restart/crash recovery
 python scripts/check.py              # static review checks
 python scripts/crash_check.py        # SIGKILL during write bursts and commits
 python scripts/demo.py --url ...     # end-to-end demo against a live service
+python scripts/budget_demo.py --url ...  # budget cap, 507 rollback and swap demo
 ```
 
 `tests/test_restart.py` and `scripts/crash_check.py` start a real uvicorn

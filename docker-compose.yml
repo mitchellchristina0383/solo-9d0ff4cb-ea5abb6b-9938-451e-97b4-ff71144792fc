@@ -9,6 +9,11 @@ services:
       # Path inside the container; overrides the Dockerfile default only if set.
       BLOCKSTORE_DB: /data/blockstore.db
       BLOCKSTORE_BUSY_TIMEOUT_SECONDS: "30"
+      # Hard byte budget for the block pool. Every allocated payload slot
+      # counts its full block length, including recycled (zeroed, free) slots.
+      # Override with BLOCKSTORE_POOL_BUDGET_BYTES=... up; leave empty/commented
+      # for an unlimited pool.
+      BLOCKSTORE_POOL_BUDGET_BYTES: "${BLOCKSTORE_POOL_BUDGET_BYTES:-128}"
     volumes:
       - blockstore-data:/data
     restart: unless-stopped

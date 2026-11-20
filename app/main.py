@@ -21,7 +21,12 @@ from fastapi import Body, Depends, FastAPI, Path, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .db import Database, busy_timeout_from_env, database_path_from_env
+from .db import (
+    Database,
+    busy_timeout_from_env,
+    database_path_from_env,
+    pool_budget_from_env,
+)
 from .service import BlockStoreService, ServiceError, validate_geometry
 
 
@@ -92,12 +97,19 @@ def get_service(request: Request) -> BlockStoreService:
 Service = Annotated[BlockStoreService, Depends(get_service)]
 
 
-def create_app(db_path: str | None = None, *, busy_timeout: float | None = None) -> FastAPI:
+def create_app(
+    db_path: str | None = None,
+    *,
+    busy_timeout: float | None = None,
+    pool_budget_bytes: int | None = ...,
+) -> FastAPI:
     database = Database(
         db_path or database_path_from_env(),
         busy_timeout=busy_timeout if busy_timeout is not None else busy_timeout_from_env(),
     )
-    block_service = BlockStoreService(database)
+    if pool_budget_bytes is ...:
+        pool_budget_bytes = pool_budget_from_env()
+    block_service = BlockStoreService(database, pool_budget_bytes=pool_budget_bytes)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -122,7 +134,14 @@ def create_app(db_path: str | None = None, *, busy_timeout: float | None = None)
             "6. `POST /bases/{base_id}/retirement/prepare` then "
             "`POST /bases/{base_id}/retirement/commit` – remove the base. "
             "Volumes stay writable and every acknowledged write is preserved; "
-            "unreferenced blocks are reclaimed for reuse.\n\n"
+            "unreferenced blocks are reclaimed for reuse.\n"
+            "7. `GET /stats` – inspect the pool byte budget "
+            "(`BLOCKSTORE_POOL_BUDGET_BYTES`). Every allocated slot, including "
+            "recycled free slots, counts its full block length. An operation "
+            "that would overflow the budget fails with `507 "
+            "pool_budget_exceeded` and rolls back completely; an overwrite or "
+            "zero still succeeds at a full pool when it replaces the old "
+            "block's sole reference (the old slot is recycled in place).\n\n"
             "Volumes that inherit the same base block share one stored copy "
             "(content-addressed payloads); references are counted per payload."
         ),

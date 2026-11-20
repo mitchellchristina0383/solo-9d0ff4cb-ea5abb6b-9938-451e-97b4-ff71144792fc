@@ -13,9 +13,18 @@ Key invariants
    need the base to serve a read, which is what makes base removal safe.
 3. References are only dropped inside the same transaction that removes the
    referring row, so a crash can never leave refcounts inconsistent.
-4. Unreferenced payloads are deleted immediately and a ``reclaim_events`` row
-   records the released bytes.  SQLite puts their pages on the freelist, where
-   the next writes reuse them.
+4. Unreferenced payloads are kept as zero-filled *free slots* (``free = 1``)
+   and a ``reclaim_events`` row records the released bytes.  Later writes
+   recycle those slots in place, so the number of payload rows -- hence the
+   pool's byte footprint -- only grows when no free slot fits.
+5. The pool has a configurable byte budget (``BLOCKSTORE_POOL_BUDGET_BYTES``).
+   Every allocated slot, including free slots, counts its full block length
+   against the budget.  Content-identical writes and same-size free-slot reuse
+   stay within it for free; when the pool is full an overwrite/zero is still
+   allowed if it replaces a payload whose only reference is the block being
+   rewritten.  Capacity failures raise inside the write transaction, so the
+   whole request rolls back -- no slot, refcount or reclaim-event change
+   survives a rejected request.
 """
 
 from __future__ import annotations
@@ -202,9 +211,122 @@ def _release_payloads(
     return freed_rows, freed_bytes
 
 
+# ---------------------------------------------------------------------------
+# byte-budget helpers (must be called inside a write transaction)
+# ---------------------------------------------------------------------------
+def _pool_used_bytes(conn: sqlite3.Connection) -> int:
+    """Bytes currently occupied by every slot, free or live.
+
+    A freed slot is zero-filled but still allocates ``block_size`` bytes in
+    the pool, so it keeps counting against the budget until reused.
+    """
+    return int(
+        conn.execute(
+            "SELECT COALESCE(SUM(length(data)), 0) FROM payloads"
+        ).fetchone()[0]
+    )
+
+
+def _raise_budget_exceeded(
+    budget: int, used: int, requested: int, available_slots: int
+) -> None:
+    raise ServiceError(
+        507,
+        f"pool byte budget exhausted: request needs {requested} new byte(s) in "
+        f"fresh slot(s), only {max(budget - used, 0)} of {budget} budget byte(s) "
+        f"are free after reusing {available_slots} matching free slot(s); the "
+        f"whole request was rolled back",
+        "pool_budget_exceeded",
+    )
+
+
+def _ensure_base_budget(
+    conn: sqlite3.Connection,
+    budget: int | None,
+    block_size: int,
+    blocks: Sequence[bytes],
+) -> None:
+    """Pre-flight a whole base import against the byte budget.
+
+    Distinct contents that already have a live payload and free slots of this
+    block size cover some blocks for free; every remaining distinct content
+    needs one newly allocated slot of ``block_size`` bytes.  Raising here --
+    before any row is inserted -- makes the rejection a clean rollback.
+    """
+    if budget is None:
+        return
+    needed_hashes = {hashlib.sha256(block).hexdigest() for block in blocks}
+    live_hashes = {
+        row["content_hash"]
+        for row in conn.execute(
+            "SELECT content_hash FROM payloads "
+            "WHERE block_size = ? AND free = 0 AND content_hash IS NOT NULL",
+            (block_size,),
+        ).fetchall()
+    }
+    distinct_new = len(needed_hashes - live_hashes)
+    if distinct_new == 0:
+        return
+    free_slots = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM payloads WHERE block_size = ? AND free = 1",
+            (block_size,),
+        ).fetchone()[0]
+    )
+    fresh_slots = max(distinct_new - free_slots, 0)
+    requested = fresh_slots * block_size
+    if requested == 0:
+        return
+    used = _pool_used_bytes(conn)
+    if used + requested > budget:
+        _raise_budget_exceeded(budget, used, requested, min(free_slots, distinct_new))
+
+
+def _acquire_payload_with_budget(
+    conn: sqlite3.Connection,
+    block_size: int,
+    data: bytes,
+    now: str,
+    budget: int | None,
+) -> int:
+    """Acquire a payload slot while enforcing the pool's byte budget.
+
+    Behaviour, in order:
+
+    1. identical live content -> shared, no budget impact;
+    2. a same-size free slot -> recycled, no budget impact;
+    3. a fresh slot fits the budget -> allocated;
+    4. otherwise -> ``507 pool_budget_exceeded``; the caller's transaction is
+       rolled back by the database layer, leaving every counter untouched.
+
+    Callers that replace an existing block must drop the old reference before
+    calling this, so the full-pool sole-reference case presents a reusable free
+    slot here instead of needing special in-place recycling logic.
+    """
+    digest = hashlib.sha256(data).hexdigest()
+    live = conn.execute(
+        "SELECT id FROM payloads "
+        "WHERE block_size = ? AND content_hash = ? AND free = 0",
+        (block_size, digest),
+    ).fetchone()
+    if live is not None:
+        return int(live["id"])
+
+    free_slot = conn.execute(
+        "SELECT id FROM payloads WHERE block_size = ? AND free = 1 ORDER BY id LIMIT 1",
+        (block_size,),
+    ).fetchone()
+    if free_slot is None and budget is not None:
+        used = _pool_used_bytes(conn)
+        if used + block_size > budget:
+            _raise_budget_exceeded(budget, used, block_size, 0)
+    return _acquire_payload(conn, block_size, data, now)
+
+
 class BlockStoreService:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, *, pool_budget_bytes: int | None = None) -> None:
         self.db = db
+        self.pool_budget_bytes = pool_budget_bytes
 
     # ------------------------------------------------------------------ bases
     def import_base(
@@ -224,13 +346,21 @@ class BlockStoreService:
         base_id = str(uuid.uuid4())
         try:
             with self.db.write() as conn:
+                # Reject the whole import up front if its genuinely-new slots
+                # would overflow the budget.  Nothing has been mutated yet, so
+                # the rollback leaves slots, refcounts and reclaim events intact.
+                _ensure_base_budget(
+                    conn, self.pool_budget_bytes, block_size, blocks
+                )
                 conn.execute(
                     "INSERT INTO bases(id, name, block_size, block_count, status, created_at) "
                     "VALUES (?, ?, ?, ?, 'active', ?)",
                     (base_id, name, block_size, len(blocks), now),
                 )
                 for index, block in enumerate(blocks):
-                    payload_id = _acquire_payload(conn, block_size, block, now)
+                    payload_id = _acquire_payload_with_budget(
+                        conn, block_size, block, now, self.pool_budget_bytes
+                    )
                     conn.execute(
                         "INSERT INTO base_blocks(base_id, block_index, payload_id) "
                         "VALUES (?, ?, ?)",
@@ -694,14 +824,41 @@ class BlockStoreService:
                     "internal_invariant",
                 )
             old_payload = int(old["payload_id"])
-            new_payload = _acquire_payload(conn, int(volume["block_size"]), data, now)
-            _add_ref(conn, new_payload, 1, now, "volume_write")
-            conn.execute(
-                "UPDATE volume_blocks SET payload_id = ?, origin = 'written' "
-                "WHERE volume_id = ? AND block_index = ?",
-                (new_payload, volume_id, block_index),
-            )
-            _add_ref(conn, old_payload, -1, now, "volume_overwrite")
+            same_content = conn.execute(
+                "SELECT id FROM payloads WHERE id = ? AND free = 0 "
+                "AND content_hash = ?",
+                (old_payload, hashlib.sha256(data).hexdigest()),
+            ).fetchone()
+            if same_content is not None:
+                # Re-pointing at identical bytes changes nothing material.
+                conn.execute(
+                    "UPDATE volume_blocks SET origin = 'written' "
+                    "WHERE volume_id = ? AND block_index = ?",
+                    (volume_id, block_index),
+                )
+                new_payload = old_payload
+            else:
+                # Drop the old reference first.  If this block was the payload's
+                # only reference its slot becomes a same-size free slot, which
+                # the budgeted acquire below recycles -- that is exactly the
+                # mandated full-pool overwrite escape hatch.  If the payload is
+                # shared (e.g. still referenced by the base) nothing is freed
+                # and a full pool makes the acquire raise 507, rolling this
+                # whole transaction (including the drop) back.
+                _add_ref(conn, old_payload, -1, now, "volume_overwrite")
+                new_payload = _acquire_payload_with_budget(
+                    conn,
+                    int(volume["block_size"]),
+                    data,
+                    now,
+                    self.pool_budget_bytes,
+                )
+                _add_ref(conn, new_payload, 1, now, "volume_write")
+                conn.execute(
+                    "UPDATE volume_blocks SET payload_id = ?, origin = 'written' "
+                    "WHERE volume_id = ? AND block_index = ?",
+                    (new_payload, volume_id, block_index),
+                )
             return {
                 "volume_id": volume_id,
                 "block_index": block_index,
@@ -734,14 +891,38 @@ class BlockStoreService:
                     "internal_invariant",
                 )
             old_payload = int(old["payload_id"])
-            zero_payload = _acquire_payload(conn, block_size, bytes(block_size), now)
-            _add_ref(conn, zero_payload, 1, now, "volume_zero")
-            conn.execute(
-                "UPDATE volume_blocks SET payload_id = ?, origin = 'zeroed' "
-                "WHERE volume_id = ? AND block_index = ?",
-                (zero_payload, volume_id, block_index),
-            )
-            _add_ref(conn, old_payload, -1, now, "volume_zero_replace")
+            zero_digest = hashlib.sha256(bytes(block_size)).hexdigest()
+            already_zero = conn.execute(
+                "SELECT id FROM payloads WHERE id = ? AND free = 0 "
+                "AND content_hash = ?",
+                (old_payload, zero_digest),
+            ).fetchone()
+            if already_zero is not None:
+                conn.execute(
+                    "UPDATE volume_blocks SET origin = 'zeroed' "
+                    "WHERE volume_id = ? AND block_index = ?",
+                    (volume_id, block_index),
+                )
+                zero_payload = old_payload
+            else:
+                # Same release-first ordering as write_volume_block: a sole
+                # reference frees the old slot for the zero payload to reuse,
+                # while a shared payload at a full pool raises 507 and rolls
+                # the drop back.
+                _add_ref(conn, old_payload, -1, now, "volume_zero_replace")
+                zero_payload = _acquire_payload_with_budget(
+                    conn,
+                    block_size,
+                    bytes(block_size),
+                    now,
+                    self.pool_budget_bytes,
+                )
+                _add_ref(conn, zero_payload, 1, now, "volume_zero")
+                conn.execute(
+                    "UPDATE volume_blocks SET payload_id = ?, origin = 'zeroed' "
+                    "WHERE volume_id = ? AND block_index = ?",
+                    (zero_payload, volume_id, block_index),
+                )
             return {
                 "volume_id": volume_id,
                 "block_index": block_index,
@@ -842,6 +1023,20 @@ class BlockStoreService:
             page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
             freelist_count = int(conn.execute("PRAGMA freelist_count").fetchone()[0])
+            pool_row = conn.execute(
+                "SELECT COUNT(*) AS slots, COALESCE(SUM(length(data)), 0) AS bytes "
+                "FROM payloads"
+            ).fetchone()
+        used_bytes = int(pool_row["bytes"])
+        budget = self.pool_budget_bytes
+        pool = {
+            "slot_count": int(pool_row["slots"]),
+            "used_bytes": used_bytes,
+            "budget_bytes": budget,
+            "limited": budget is not None,
+            "available_bytes": None if budget is None else max(budget - used_bytes, 0),
+            "utilization": None if budget is None or budget == 0 else used_bytes / budget,
+        }
         return {
             "bases": bases,
             "base_blocks_stored": base_blocks,
@@ -856,6 +1051,7 @@ class BlockStoreService:
                 "count": int(free_row["n"]),
                 "bytes": int(free_row["bytes"]),
             },
+            "pool_budget": pool,
             "reclaim": {
                 "events": int(reclaim["n"]),
                 "bytes_released": int(reclaim["bytes"]),
@@ -974,6 +1170,17 @@ class BlockStoreService:
             ).fetchone()[0]
             if int(bad_free):
                 issues.append({"check": "free_slots_zeroed", "count": int(bad_free)})
+            # 6. the byte budget (live slots + recycled free slots) must hold.
+            if self.pool_budget_bytes is not None:
+                used = _pool_used_bytes(conn)
+                if used > self.pool_budget_bytes:
+                    issues.append(
+                        {
+                            "check": "pool_budget",
+                            "used_bytes": used,
+                            "budget_bytes": self.pool_budget_bytes,
+                        }
+                    )
             counts = {
                 "payloads": int(
                     conn.execute(

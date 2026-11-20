@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db import Database
+from app.db import Database, pool_budget_from_env
 from app.main import create_app
 
 
@@ -27,3 +27,16 @@ def test_default_db_path_env(monkeypatch):
     assert db_module.busy_timeout_from_env() == 7.5
     monkeypatch.setenv("BLOCKSTORE_BUSY_TIMEOUT_SECONDS", "not-a-number")
     assert db_module.busy_timeout_from_env() == 30.0
+
+
+def test_pool_budget_env_parsing(monkeypatch):
+    monkeypatch.delenv("BLOCKSTORE_POOL_BUDGET_BYTES", raising=False)
+    assert pool_budget_from_env() is None
+    monkeypatch.setenv("BLOCKSTORE_POOL_BUDGET_BYTES", "")
+    assert pool_budget_from_env() is None
+    monkeypatch.setenv("BLOCKSTORE_POOL_BUDGET_BYTES", "4096")
+    assert pool_budget_from_env() == 4096
+    for bad in ("0", "-5", "12.5", "lots"):
+        monkeypatch.setenv("BLOCKSTORE_POOL_BUDGET_BYTES", bad)
+        with pytest.raises(RuntimeError, match="BLOCKSTORE_POOL_BUDGET_BYTES"):
+            pool_budget_from_env()

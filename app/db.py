@@ -21,9 +21,11 @@ payload row, and ``payloads.refcount`` counts every reference:
   was explicitly zeroed, or was written by the client.
 
 When a reference is dropped (overwrite, volume deletion, base retirement) the
-refcount is decremented and, if it reaches zero, the payload row is deleted.
-That is the reclamation step: bytes that no volume inherits become reusable
-for later writes, and SQLite reuses the freed pages.
+refcount is decremented and, if it reaches zero, the payload slot is not
+deleted: its bytes are zeroed, its content address cleared and the row becomes
+a reusable free slot (with a ``reclaim_events`` audit row).  That is the
+reclamation step -- the slot still occupies its block length, which is why it
+keeps counting against the pool byte budget until a later write recycles it.
 
 Bases move ``active -> retiring -> retired``.  Retirement is split into
 *prepare* (volumes keep serving and accepting writes) and *commit*, which drops
@@ -266,3 +268,27 @@ def busy_timeout_from_env() -> float:
         return float(raw)
     except ValueError:
         return 30.0
+
+
+def pool_budget_from_env() -> int | None:
+    """Return the pool byte budget from ``BLOCKSTORE_POOL_BUDGET_BYTES``.
+
+    Unset/empty means *unlimited*.  A configured value must be a positive
+    integer -- a bad value is a deployment error, so fail loudly at startup
+    rather than silently running without a cap.
+    """
+    raw = os.environ.get("BLOCKSTORE_POOL_BUDGET_BYTES", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"BLOCKSTORE_POOL_BUDGET_BYTES must be a positive integer of bytes, "
+            f"got {raw!r}"
+        ) from exc
+    if value < 1:
+        raise RuntimeError(
+            f"BLOCKSTORE_POOL_BUDGET_BYTES must be >= 1 (or unset for unlimited), got {value}"
+        )
+    return value
